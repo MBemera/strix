@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-import os
 import stat
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
+
+import pytest
 
 
 RELEASE_VERSION = "9.9.9"
 RELEASE_TARGET = "linux-arm64"
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="scripts/install.sh is a POSIX shell installer",
+)
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -27,12 +34,18 @@ def _create_release_archive(tmp_path: Path) -> Path:
     return archive_path
 
 
-def _create_mock_commands(tmp_path: Path) -> Path:
+def _create_mock_commands(tmp_path: Path, machine: str) -> Path:
     mock_bin = tmp_path / "mock-bin"
     mock_bin.mkdir()
     _write_executable(
         mock_bin / "uname",
-        '#!/bin/sh\n[ "$1" = "-s" ] && echo Linux || echo aarch64\n',
+        f"""#!/bin/sh
+case "$1" in
+  -s) echo Linux ;;
+  -m) echo {machine} ;;
+  *) echo "unexpected uname argument: $*" >&2; exit 1 ;;
+esac
+""",
     )
     _write_executable(mock_bin / "docker", "#!/bin/sh\nexit 0\n")
     _write_executable(
@@ -59,21 +72,27 @@ def _create_installer_environment(
     archive_path: Path,
     mock_bin: Path,
 ) -> tuple[dict[str, str], Path, Path]:
+    """Build the installer environment explicitly.
+
+    Every variable the installer reads is listed here, so no inherited value
+    (`XDG_CONFIG_HOME`, `GITHUB_ACTIONS`, `TMPDIR`, ...) can send a write
+    outside the sandbox or change the code path under test.
+    """
     home_path = tmp_path / "home"
     home_path.mkdir()
+    download_path = tmp_path / "downloads"
+    download_path.mkdir()
     curl_log_path = tmp_path / "curl.log"
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "HOME": str(home_path),
-            "PATH": f"{mock_bin}:/usr/bin:/bin",
-            "SHELL": "/bin/bash",
-            "STRIX_TEST_ARCHIVE": str(archive_path),
-            "STRIX_TEST_CURL_LOG": str(curl_log_path),
-            "VERSION": RELEASE_VERSION,
-        }
-    )
-    environment.pop("GITHUB_ACTIONS", None)
+    environment = {
+        "HOME": str(home_path),
+        "XDG_CONFIG_HOME": str(home_path / ".config"),
+        "PATH": f"{mock_bin}:/usr/bin:/bin",
+        "SHELL": "/bin/bash",
+        "TMPDIR": str(download_path),
+        "STRIX_TEST_ARCHIVE": str(archive_path),
+        "STRIX_TEST_CURL_LOG": str(curl_log_path),
+        "VERSION": RELEASE_VERSION,
+    }
     return environment, home_path, curl_log_path
 
 
@@ -94,7 +113,7 @@ def _run_installer(
 def test_installer_downloads_and_runs_linux_arm64_release(tmp_path: Path) -> None:
     repository_root = Path(__file__).resolve().parents[1]
     archive_path = _create_release_archive(tmp_path)
-    mock_bin = _create_mock_commands(tmp_path)
+    mock_bin = _create_mock_commands(tmp_path, machine="aarch64")
     environment, home_path, curl_log_path = _create_installer_environment(
         tmp_path,
         archive_path,
@@ -109,9 +128,27 @@ def test_installer_downloads_and_runs_linux_arm64_release(tmp_path: Path) -> Non
 
     installed_binary = home_path / ".strix/bin/strix"
     installed_result = subprocess.run(  # noqa: S603
-        [installed_binary, "--version"],
+        [str(installed_binary), "--version"],
         capture_output=True,
         text=True,
         check=True,
     )
     assert installed_result.stdout.strip() == f"strix {RELEASE_VERSION}"
+
+
+def test_installer_rejects_unsupported_architecture(tmp_path: Path) -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    archive_path = _create_release_archive(tmp_path)
+    mock_bin = _create_mock_commands(tmp_path, machine="riscv64")
+    environment, home_path, curl_log_path = _create_installer_environment(
+        tmp_path,
+        archive_path,
+        mock_bin,
+    )
+
+    result = _run_installer(repository_root, environment)
+
+    assert result.returncode != 0
+    assert "Unsupported OS/Arch: linux/riscv64" in result.stdout
+    assert not curl_log_path.exists()
+    assert not (home_path / ".strix").exists()

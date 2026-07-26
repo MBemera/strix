@@ -184,15 +184,15 @@ def test_release_target(
 def test_self_update_uses_linux_arm64_release(monkeypatch: pytest.MonkeyPatch) -> None:
     requested_update: list[tuple[str, str]] = []
 
+    def record_download(version: str, target: str, _console: Console) -> bool:
+        requested_update.append((version, target))
+        return True
+
     monkeypatch.setattr(update_check, "is_binary_install", lambda: True)
     monkeypatch.setattr(update_check, "get_version", lambda: "1.0.0")
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(platform, "machine", lambda: "aarch64")
-    monkeypatch.setattr(
-        update_check,
-        "_download_and_replace",
-        lambda version, target, _console: requested_update.append((version, target)) or True,
-    )
+    monkeypatch.setattr(update_check, "_download_and_replace", record_download)
 
     assert update_check.self_update(Console(file=io.StringIO()), version="1.1.0") is True
     assert requested_update == [("1.1.0", "linux-arm64")]
